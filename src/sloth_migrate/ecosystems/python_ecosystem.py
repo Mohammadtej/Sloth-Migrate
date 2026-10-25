@@ -80,47 +80,44 @@ class PythonEcosystem(BaseEcosystem):
             return 1, "pytest executable not found in current environment."
 
     def parse_traceback(self, test_output: str, repo_dir: Path) -> list[FailureContext]:
-        """Parses pytest output to extract failing file paths, lines, and error types."""
+        """Scans the repository for files mentioned in the test failure output."""
         failures: list[FailureContext] = []
+        
+        # 1. Discover all candidate python files in the target project
+        project_files = [
+            f for f in repo_dir.rglob("*.py")
+            if not any(part in f.parts for part in [".venv", "venv", ".git", "__pycache__", "build", "dist"])
+        ]
 
-        # Pattern 1: Standard Python exception lines (e.g., File "app.py", line 42, in <module>)
-        frame_pattern = re.compile(
-            r'File "([^"]+\.py)", line (\d+)(?:, in .*)?\n\s*(.*?)\n([A-Za-z0-9_]+Error|[A-Za-z0-9_]+Warning): (.*)',
-            re.MULTILINE,
-        )
+        # 2. Find which project files are actually mentioned in the output
+        matched_files: list[Path] = []
+        for file_path in project_files:
+            rel_path = file_path.relative_to(repo_dir)
+            
+            # Check relative path (posix and windows formats) and just filename
+            if (
+                rel_path.as_posix() in test_output
+                or str(rel_path) in test_output
+                or file_path.name in test_output
+            ):
+                matched_files.append(file_path)
 
-        for match in frame_pattern.finditer(test_output):
-            raw_path, line_str, code_snippet, err_type, err_msg = match.groups()
-            candidate_path = Path(raw_path)
-            if not candidate_path.is_absolute():
-                candidate_path = repo_dir / candidate_path
+        if not matched_files:
+            return []
 
-            # Only target user project files, ignore test runners or virtualenvs
-            if candidate_path.exists() and "site-packages" not in str(candidate_path):
-                failures.append(
-                    FailureContext(
-                        file_path=candidate_path,
-                        line_number=int(line_str),
-                        error_type=err_type,
-                        failure_message=err_msg.strip(),
-                        raw_traceback=match.group(0),
-                    )
+        # 3. Prioritize source files over test files (fix root causes before tests)
+        matched_files.sort(key=lambda p: 1 if p.name.startswith("test_") or p.name.endswith("_test.py") else 0)
+
+        # 4. Construct contexts for the matched files
+        for target_file in matched_files:
+            failures.append(
+                FailureContext(
+                    file_path=target_file,
+                    line_number=None,  # Not needed: Gemma identifies the line from the trace
+                    error_type="Test Failure / Deprecation",
+                    failure_message="Refer to the attached traceback",
+                    raw_traceback=test_output[-2500:],  # Provide sufficient tail context
                 )
-
-        # Pattern 2: Pytest Summary Failure headers (e.g. FAILED test_app.py::test_user - AttributeError: ...)
-        summary_pattern = re.compile(r"FAILED\s+([^:]+\.py)::(\w+)\s+-\s+([A-Za-z0-9_]+Error): (.*)")
-        for match in summary_pattern.finditer(test_output):
-            file_str, test_func, err_type, err_msg = match.groups()
-            candidate_path = repo_dir / file_str
-            if candidate_path.exists() and not any(f.file_path == candidate_path for f in failures):
-                failures.append(
-                    FailureContext(
-                        file_path=candidate_path,
-                        line_number=None,
-                        error_type=err_type,
-                        failure_message=f"{test_func}: {err_msg.strip()}",
-                        raw_traceback=test_output[-1500:],
-                    )
-                )
+            )
 
         return failures

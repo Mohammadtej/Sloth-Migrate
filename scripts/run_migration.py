@@ -64,6 +64,8 @@ async def run_pydantic_migration(
     max_attempts = settings.max_repair_attempts
     files_modified: set[Path] = set()
 
+    console.print(f"Defined max attempts in the system {max_attempts}")
+
     while iteration < max_attempts:
         iteration += 1
         console.print(
