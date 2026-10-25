@@ -4,6 +4,17 @@ import difflib
 from pathlib import Path
 import shutil
 import sys
+
+# Ensure src/ is on sys.path when running as a standalone script
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+
+# Support UTF-8 output on Windows consoles
+if sys.platform == "win32":
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8")
+
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table

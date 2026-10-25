@@ -2,6 +2,7 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import sys
 from sloth_migrate.ecosystems.base import BaseEcosystem, FailureContext
 
 
@@ -55,6 +56,8 @@ class PythonEcosystem(BaseEcosystem):
         env = os.environ.copy()
         # Elevates deprecation warnings to catch soft breaks proactively
         cmd = [
+            sys.executable,
+            "-m",
             "pytest",
             "-v",
             "-W", "error::DeprecationWarning",
