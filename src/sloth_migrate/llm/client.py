@@ -4,7 +4,7 @@ from typing import Any
 import httpx
 
 from sloth_migrate.config import settings
-from sloth_migrate.telemetry.sentry import trace_agent_action
+from sloth_migrate.telemetry.sentry import trace_span
 
 
 class GemmaClient:
@@ -36,10 +36,9 @@ class GemmaClient:
             "max_tokens": settings.llm_max_tokens,
         }
 
-        with trace_agent_action(
-            action_name="gemma.generate_fix",
+        with trace_span(
+            name=f"Gemma Chat: {self.model}",
             op="ai.chat_completions",
-            description=f"Gemma AST patch request ({self.model})",
             data={
                 "ai.model_id": self.model,
                 "ai.temperature": settings.llm_temperature,

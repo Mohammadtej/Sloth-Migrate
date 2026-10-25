@@ -1,4 +1,4 @@
-"""Sentry Agent Tracing and observability instrumentation for SlothMigrate."""
+"""Sentry AI Agent Observability integration for SlothMigrate."""
 
 from contextlib import contextmanager
 from typing import Any, Generator
@@ -10,7 +10,7 @@ from sloth_migrate.config import settings
 
 def init_telemetry() -> bool:
     """Initializes Sentry SDK if SENTRY_DSN is configured in environment."""
-    if not settings.sentry_dsn:
+    if not settings.sentry_dsn or not settings.sentry_dsn.strip():
         return False
 
     sentry_sdk.init(
@@ -24,19 +24,22 @@ def init_telemetry() -> bool:
 
 
 @contextmanager
-def trace_agent_action(
-    action_name: str,
+def trace_span(
+    name: str,
     op: str = "ai.tool",
-    description: str | None = None,
     data: dict[str, Any] | None = None,
 ) -> Generator[Span | None, None, None]:
-    """Context manager recording spans for agent actions, tool calls, and LLM queries."""
-    if not settings.sentry_dsn:
+    """Records a granular child span within the active Sentry transaction."""
+    if not settings.sentry_dsn or not settings.sentry_dsn.strip():
         yield None
         return
 
-    with sentry_sdk.start_span(op=op, description=description or action_name) as span:
+    with sentry_sdk.start_span(op=op, description=name) as span:
         if data:
-            for k, v in data.items():
-                span.set_data(k, v)
+            for key, val in data.items():
+                span.set_data(key, val)
         yield span
+
+
+# Alias for backward compatibility
+trace_agent_action = trace_span
