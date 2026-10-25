@@ -4,7 +4,8 @@ import re
 import subprocess
 import sys
 from sloth_migrate.ecosystems.base import BaseEcosystem, FailureContext
-
+import httpx
+import tomli
 
 class PythonEcosystem(BaseEcosystem):
     name = "python"
@@ -121,3 +122,41 @@ class PythonEcosystem(BaseEcosystem):
             )
 
         return failures
+
+    def list_dependencies(self, repo_dir: Path) -> dict[str, str]:
+        """Discovers declared packages and their version constraints."""
+        deps: dict[str, str] = {}
+        pyproject = repo_dir / "pyproject.toml"
+        requirements = repo_dir / "requirements.txt"
+
+        if pyproject.exists():
+            try:
+                data = tomli.loads(pyproject.read_text(encoding="utf-8"))
+                # Standard PEP 621 dependencies
+                project_deps = data.get("project", {}).get("dependencies", [])
+                for dep in project_deps:
+                    match = re.match(r"^([a-zA-Z0-9_\-]+)(.*)$", dep.strip())
+                    if match:
+                        deps[match.group(1)] = match.group(2).strip() or "unconstrained"
+            except Exception:
+                pass
+
+        if requirements.exists() and not deps:
+            for line in requirements.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if line and not line.startswith(("#", "-")):
+                    match = re.match(r"^([a-zA-Z0-9_\-]+)(.*)$", line)
+                    if match:
+                        deps[match.group(1)] = match.group(2).strip() or "unconstrained"
+
+        return deps
+
+    async def get_latest_pypi_version(self, package_name: str) -> str | None:
+        """Queries the official PyPI JSON API for the latest stable version."""
+        url = f"https://pypi.org/pypi/{package_name}/json"
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(url)
+            if resp.status_code == 200:
+                data = resp.json()
+                return data.get("info", {}).get("version")
+        return None

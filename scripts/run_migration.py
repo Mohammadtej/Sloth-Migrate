@@ -28,12 +28,16 @@ from sloth_migrate.llm.prompts import SYSTEM_REFACTOR_PROMPT, USER_REFACTOR_TEMP
 console = Console()
 
 
-async def run_pydantic_migration(
-    fixture_dir: Path,
-    target_pkg: str = "pydantic",
-    target_ver: str = "2.0.0",
+async def run_generic_migration(
+    target_dir: Path,
+    target_pkg: str,
+    target_ver: str,
 ) -> bool:
-    """Executes the closed-loop dependency migration and AST repair process."""
+    """Runs dependency bump + test + Gemma patch loop for ANY package."""
+    # Logic remains identical:
+    # 1. ecosystem.bump_dependency(target_dir, target_pkg, target_ver)
+    # 2. Loop pytest -> if fail, grab target_file and send to Gemma
+    # 3. Gemma refactors code to fix the traceback
     # init_telemetry()
     ecosystem = PythonEcosystem()
 

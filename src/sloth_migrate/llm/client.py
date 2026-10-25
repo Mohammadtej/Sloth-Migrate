@@ -42,12 +42,12 @@ class GemmaClient:
 
         return self._extract_code_block(raw_text)
 
-def _extract_code_block(self, raw_response: str) -> str:
-    """Extracts code enclosed in triple backticks and removes extraneous outer indentation."""
-    code_match = re.search(r"```(?:python)?\s*\n(.*?)```", raw_response, re.DOTALL)
-    extracted = code_match.group(1) if code_match else raw_response
-    # Removes any universal leading whitespace added by markdown rendering
-    return textwrap.dedent(extracted).strip() + "\n"
+    def _extract_code_block(self, raw_response: str) -> str:
+        """Extracts code enclosed in triple backticks and removes extraneous outer indentation."""
+        code_match = re.search(r"```(?:python)?\s*\n(.*?)```", raw_response, re.DOTALL)
+        extracted = code_match.group(1) if code_match else raw_response
+        # Removes any universal leading whitespace added by markdown rendering
+        return textwrap.dedent(extracted).strip() + "\n"
 
 
 gemma_client = GemmaClient()
