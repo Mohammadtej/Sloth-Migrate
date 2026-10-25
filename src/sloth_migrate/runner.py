@@ -1,29 +1,14 @@
-#!/usr/bin/env python3
-import asyncio
 import difflib
 from pathlib import Path
-import shutil
-import sys
-
-# Ensure src/ is on sys.path when running as a standalone script
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
-
-# Support UTF-8 output on Windows consoles
-if sys.platform == "win32":
-    if hasattr(sys.stdout, "reconfigure"):
-        sys.stdout.reconfigure(encoding="utf-8")
-    if hasattr(sys.stderr, "reconfigure"):
-        sys.stderr.reconfigure(encoding="utf-8")
-
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
+from sloth_migrate.ast_guard import validate_python_code
 from sloth_migrate.config import settings
 from sloth_migrate.ecosystems.python_ecosystem import PythonEcosystem
 from sloth_migrate.llm.client import gemma_client
 from sloth_migrate.llm.prompts import SYSTEM_REFACTOR_PROMPT, USER_REFACTOR_TEMPLATE
-# from sloth_migrate.telemetry.sentry import init_telemetry
 
 console = Console()
 
@@ -33,12 +18,7 @@ async def run_generic_migration(
     target_pkg: str,
     target_ver: str,
 ) -> bool:
-    """Runs dependency bump + test + Gemma patch loop for ANY package."""
-    # Logic remains identical:
-    # 1. ecosystem.bump_dependency(target_dir, target_pkg, target_ver)
-    # 2. Loop pytest -> if fail, grab target_file and send to Gemma
-    # 3. Gemma refactors code to fix the traceback
-    # init_telemetry()
+    """Executes the closed-loop dependency migration, AST repair, and test verification process."""
     ecosystem = PythonEcosystem()
 
     console.print(
@@ -59,16 +39,22 @@ async def run_generic_migration(
     console.print(f"\n[bold blue]Step 1:[/bold blue] Bumping [cyan]{target_pkg}[/cyan] in manifest...")
     bumped = ecosystem.bump_dependency(target_dir, target_pkg, target_ver)
     if bumped:
-        console.print(f"  [green]✔ Updated manifest specification to {target_pkg}>={target_ver}[/green]")
+        console.print(f"  [green]✔ Updated manifest to {target_pkg}>={target_ver}[/green]")
     else:
-        console.print("  [yellow]⚠ No matching entry found in manifest; proceeding with current environment.[/yellow]")
+        console.print("  [yellow]⚠ No matching entry in manifest; proceeding with environment update.[/yellow]")
 
-    # Step 2: The Self-Healing Feedback Loop
+    # Step 2: Ensure target version is installed in the active environment
+    console.print(f"  [cyan]Verifying/Installing {target_pkg}>={target_ver} in runtime environment...[/cyan]")
+    installed, install_log = ecosystem.install_dependency(target_pkg, target_ver)
+    if installed:
+        console.print("  [green]✔ Environment package dependencies satisfied.[/green]")
+    else:
+        console.print(f"  [yellow]⚠ Package install note: {install_log.strip()[:200]}[/yellow]")
+
+    # Step 3: Self-Healing Feedback Loop
     iteration = 0
     max_attempts = settings.max_repair_attempts
     files_modified: set[Path] = set()
-
-    console.print(f"Defined max attempts in the system {max_attempts}")
 
     while iteration < max_attempts:
         iteration += 1
@@ -83,29 +69,30 @@ async def run_generic_migration(
             _print_summary(True, iteration, files_modified)
             return True
 
-        console.print("  [red]✖ Tests failed as expected due to breaking changes/deprecations.[/red]")
-
-# Step 3: Parse Failure Traceback
+        # Step 4: Parse failure points first (including collection errors)
         failures = ecosystem.parse_traceback(test_output, target_dir)
+
         if not failures:
-            # Handle pytest exit code 5 (no tests collected)
-            if "collected 0 items" in test_output or "no tests ran" in test_output:
-                console.print("[red]✖ Pytest collected 0 tests. Check test file discovery.[/red]")
+            # Only treat as dead end if zero files matched AND it's truly an empty suite
+            if "collected 0 items" in test_output and "error" not in test_output.lower():
+                console.print("[red]✖ Tests failed: 0 tests collected and no errors found. Test suite may be empty.[/red]")
             else:
                 console.print("[red]Could not isolate specific project files from pytest output.[/red]")
-                console.print(Panel(test_output[-1200:], title="Raw Pytest Output", border_style="red"))
+            console.print(Panel(test_output[-1200:], title="Raw Pytest Output", border_style="red"))
             break
 
+        console.print("  [red]✖ Tests failed as expected due to breaking changes/deprecations.[/red]")
         console.print(f"  [yellow]Found {len(failures)} actionable failure point(s):[/yellow]")
         for f in failures:
             console.print(f"    • [cyan]{f.file_path.name}[/cyan] -> [red]{f.error_type}[/red]")
 
-        # Step 4: Patch ONLY the primary target file (failures[0]), then immediately test again!
+        # Step 5: Select ONLY the top culprit (failures[0])
         primary_failure = failures[0]
         target_file = primary_failure.file_path
 
         if not target_file.exists():
-            continue
+            console.print(f"  [red]File {target_file} does not exist.[/red]")
+            break
 
         original_code = target_file.read_text(encoding="utf-8")
         console.print(f"\n  [cyan]🤖 Asking Gemma to patch primary culprit: {target_file.name}...[/cyan]")
@@ -131,10 +118,21 @@ async def run_generic_migration(
             console.print(f"  [yellow]No syntax changes produced for {target_file.name}.[/yellow]")
             continue
 
+        # Step 6: AST Validation Gate
+        validation = validate_python_code(repaired_code, filename=target_file.name)
+        if not validation.is_valid:
+            console.print(
+                f"  [red]⚠ AST validation failed: {validation.error_message}. Rejecting patch to protect codebase.[/red]"
+            )
+            continue
+
+        # Step 7: Apply Verified Patch
         _display_diff(original_code, repaired_code, target_file.name)
         target_file.write_text(repaired_code, encoding="utf-8")
         files_modified.add(target_file)
-        console.print(f"  [green]✔ Applied unified patch to {target_file.name}[/green]")
+        console.print(f"  [green]✔ Applied AST-verified patch to {target_file.name}[/green]")
+
+        # Re-run pytest on next iteration against this patch
 
     console.print("\n[red]❌ Maximum repair attempts reached without achieving a green test suite.[/red]")
     _print_summary(False, iteration, files_modified)
@@ -142,7 +140,6 @@ async def run_generic_migration(
 
 
 def _display_diff(old_text: str, new_text: str, filename: str) -> None:
-    """Renders a clean unified terminal diff of the code changes."""
     diff = list(
         difflib.unified_diff(
             old_text.splitlines(),
@@ -170,7 +167,6 @@ def _display_diff(old_text: str, new_text: str, filename: str) -> None:
 
 
 def _print_summary(success: bool, iterations: int, modified_files: set[Path]) -> None:
-    """Prints a structured final report table."""
     table = Table(title="Migration Run Summary", border_style="green" if success else "red")
     table.add_column("Metric", style="bold")
     table.add_column("Value")
@@ -182,13 +178,3 @@ def _print_summary(success: bool, iterations: int, modified_files: set[Path]) ->
         table.add_row("Modified File", f.name)
 
     console.print(table)
-
-
-if __name__ == "__main__":
-    default_fixture = Path("tests/fixtures/legacy_python_project")
-    if not default_fixture.exists():
-        console.print(f"[red]Error: Fixture directory '{default_fixture}' not found.[/red]")
-        sys.exit(1)
-
-    success = asyncio.run(run_pydantic_migration(default_fixture))
-    sys.exit(0 if success else 1)
