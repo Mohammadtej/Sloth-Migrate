@@ -1,12 +1,14 @@
 import re
+import textwrap
 from typing import Any
 import httpx
+
 from sloth_migrate.config import settings
-import textwrap
+from sloth_migrate.telemetry.sentry import trace_agent_action
 
 
 class GemmaClient:
-    """Universal client for Gemma models (Google AI Studio, Ollama, vLLM, or DO Droplet)."""
+    """Universal client for Gemma models (Google AI Studio, Ollama, vLLM)."""
 
     def __init__(self) -> None:
         self.base_url = settings.llm_base_url.rstrip("/")
@@ -34,19 +36,32 @@ class GemmaClient:
             "max_tokens": settings.llm_max_tokens,
         }
 
-        async with httpx.AsyncClient(timeout=90.0) as client:
-            response = await client.post(endpoint, headers=self.headers, json=payload)
-            response.raise_for_status()
-            data = response.json()
-            raw_text = data["choices"][0]["message"]["content"].strip()
+        with trace_agent_action(
+            action_name="gemma.generate_fix",
+            op="ai.chat_completions",
+            description=f"Gemma AST patch request ({self.model})",
+            data={
+                "ai.model_id": self.model,
+                "ai.temperature": settings.llm_temperature,
+                "ai.max_tokens": settings.llm_max_tokens,
+            },
+        ) as span:
+            async with httpx.AsyncClient(timeout=90.0) as client:
+                response = await client.post(endpoint, headers=self.headers, json=payload)
+                response.raise_for_status()
+                data = response.json()
+                raw_text = data["choices"][0]["message"]["content"].strip()
+
+                if span and "usage" in data:
+                    span.set_data("ai.total_tokens", data["usage"].get("total_tokens"))
+                    span.set_data("ai.prompt_tokens", data["usage"].get("prompt_tokens"))
+                    span.set_data("ai.completion_tokens", data["usage"].get("completion_tokens"))
 
         return self._extract_code_block(raw_text)
 
     def _extract_code_block(self, raw_response: str) -> str:
-        """Extracts code enclosed in triple backticks and removes extraneous outer indentation."""
         code_match = re.search(r"```(?:python)?\s*\n(.*?)```", raw_response, re.DOTALL)
         extracted = code_match.group(1) if code_match else raw_response
-        # Removes any universal leading whitespace added by markdown rendering
         return textwrap.dedent(extracted).strip() + "\n"
 
 
