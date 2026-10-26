@@ -1,197 +1,206 @@
-import os
-from pathlib import Path
+"""Python ecosystem dependency manager and test execution harness."""
+
+from __future__ import annotations
+
+import ast
 import re
 import subprocess
 import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
 import httpx
 
 try:
-    import tomllib
-except ModuleNotFoundError:
-    import tomli as tomllib
+    import tomllib  # Python 3.11+
+except ImportError:
+    import tomli as tomllib  # type: ignore
 
-from sloth_migrate.ecosystems.base import BaseEcosystem, FailureContext
+from sloth_migrate.ecosystems.base import BaseEcosystem
+
+
+@dataclass
+class FailurePoint:
+    file_path: Path
+    line_number: Optional[int]
+    error_type: str
+    raw_traceback: str
 
 
 class PythonEcosystem(BaseEcosystem):
-    name = "python"
+    """Manages Python dependency manifests, sandbox package installations, and test runs."""
 
-    def detect(self, repo_dir: Path) -> bool:
+    def detect(self, repo_path: Path) -> bool:
+        """Returns True if the folder contains a Python manifest."""
         return (
-            (repo_dir / "pyproject.toml").exists()
-            or (repo_dir / "requirements.txt").exists()
-            or (repo_dir / "setup.py").exists()
+            (repo_path / "pyproject.toml").exists()
+            or (repo_path / "requirements.txt").exists()
+            or (repo_path / "setup.py").exists()
         )
 
-    def list_dependencies(self, repo_dir: Path) -> dict[str, str]:
-        """Discovers declared packages and their version constraints."""
-        deps: dict[str, str] = {}
-        pyproject = repo_dir / "pyproject.toml"
-        requirements = repo_dir / "requirements.txt"
+    def list_dependencies(self, repo_path: Path) -> Dict[str, str]:
+        """Extracts declared packages and version constraints from pyproject.toml or requirements.txt."""
+        deps: Dict[str, str] = {}
 
-        if pyproject.exists():
+        # 1. Try pyproject.toml
+        pyproject_file = repo_path / "pyproject.toml"
+        if pyproject_file.exists():
             try:
-                data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
-                project_deps = data.get("project", {}).get("dependencies", [])
-                for dep in project_deps:
-                    match = re.match(r"^([a-zA-Z0-9_\-]+)(.*)$", dep.strip())
-                    if match:
-                        deps[match.group(1)] = match.group(2).strip() or "unconstrained"
+                content = tomllib.loads(pyproject_file.read_text(encoding="utf-8"))
+                # PEP 621 dependencies
+                project_deps = content.get("project", {}).get("dependencies", [])
+                for item in project_deps:
+                    pkg, constraint = self._parse_requirement_str(item)
+                    if pkg:
+                        deps[pkg] = constraint
+
+                # Poetry dependencies
+                poetry_deps = content.get("tool", {}).get("poetry", {}).get("dependencies", {})
+                for pkg, constraint in poetry_deps.items():
+                    if pkg.lower() != "python":
+                        deps[pkg] = str(constraint)
             except Exception:
                 pass
 
-        if requirements.exists() and not deps:
-            for line in requirements.read_text(encoding="utf-8").splitlines():
+        # 2. Check requirements.txt
+        req_file = repo_path / "requirements.txt"
+        if req_file.exists():
+            for line in req_file.read_text(encoding="utf-8").splitlines():
                 line = line.strip()
-                if line and not line.startswith(("#", "-")):
-                    match = re.match(r"^([a-zA-Z0-9_\-]+)(.*)$", line)
-                    if match:
-                        deps[match.group(1)] = match.group(2).strip() or "unconstrained"
+                if not line or line.startswith("#") or line.startswith("-"):
+                    continue
+                pkg, constraint = self._parse_requirement_str(line)
+                if pkg and pkg not in deps:
+                    deps[pkg] = constraint
 
         return deps
 
-    async def get_latest_pypi_version(self, package_name: str) -> str | None:
-        """Queries the official PyPI JSON API for the latest stable release."""
-        url = f"https://pypi.org/pypi/{package_name}/json"
-        try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                resp = await client.get(url)
-                if resp.status_code == 200:
-                    data = resp.json()
-                    return data.get("info", {}).get("version")
-        except Exception:
-            pass
-        return None
+    def bump_dependency(self, repo_path: Path, package: str, target_version: str) -> bool:
+        """Rewrites the dependency constraint in pyproject.toml or requirements.txt."""
+        normalized_pkg = package.lower()
 
-    def bump_dependency(self, repo_dir: Path, package: str, target_version: str) -> bool:
-        """Updates the version constraint in pyproject.toml or requirements.txt."""
-        pyproject_path = repo_dir / "pyproject.toml"
-        requirements_path = repo_dir / "requirements.txt"
-
-        version_spec = (
-            f">={target_version}"
-            if not target_version.startswith((">=", "==", "^", "~="))
-            else target_version
-        )
-
-        # 1. Update pyproject.toml
-        if pyproject_path.exists():
-            content = pyproject_path.read_text(encoding="utf-8")
-            pattern = rf'("{re.escape(package)}[<>=~^!][^"]*"|"{re.escape(package)}")'
-            if re.search(pattern, content):
-                new_content = re.sub(pattern, f'"{package}{version_spec}"', content)
-                pyproject_path.write_text(new_content, encoding="utf-8")
-                return True
-
-        # 2. Update requirements.txt
-        if requirements_path.exists():
-            lines = requirements_path.read_text(encoding="utf-8").splitlines()
+        # 1. Check requirements.txt
+        req_file = repo_path / "requirements.txt"
+        if req_file.exists():
+            lines = req_file.read_text(encoding="utf-8").splitlines()
             updated = False
             new_lines = []
             for line in lines:
-                clean_line = line.strip()
-                if clean_line.startswith(package) and (
-                    len(clean_line) == len(package) or clean_line[len(package)] in "=<>~"
-                ):
-                    new_lines.append(f"{package}{version_spec}")
+                pkg_match = re.match(r"^([a-zA-Z0-9_\-\.]+)(.*)$", line.strip())
+                if pkg_match and pkg_match.group(1).lower() == normalized_pkg:
+                    new_lines.append(f"{package}>={target_version}")
                     updated = True
                 else:
                     new_lines.append(line)
             if updated:
-                requirements_path.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+                req_file.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+                return True
+
+        # 2. Check pyproject.toml
+        pyproject_file = repo_path / "pyproject.toml"
+        if pyproject_file.exists():
+            text = pyproject_file.read_text(encoding="utf-8")
+            pattern = re.compile(
+                rf'(["\']?{re.escape(package)}["\']?\s*[:=]\s*["\'])([^"\']+)(["\'])',
+                re.IGNORECASE,
+            )
+            if pattern.search(text):
+                new_text = pattern.sub(rf"\g<1>>={target_version}\g<3>", text)
+                pyproject_file.write_text(new_text, encoding="utf-8")
                 return True
 
         return False
 
-    def install_dependency(self, package: str, version: str) -> tuple[bool, str]:
-        """Upgrades the target package in the active Python environment."""
-        version_spec = (
-            f">={version}"
-            if not version.startswith((">=", "==", "^", "~="))
-            else version
-        )
-        target_spec = f"{package}{version_spec}"
-        cmd = [sys.executable, "-m", "pip", "install", "--upgrade", target_spec]
-
+    def install_dependency(self, package: str, target_version: str) -> Tuple[bool, str]:
+        """Installs the target package version into the running Python environment."""
+        specifier = f"{package}>={target_version}"
+        cmd = [sys.executable, "-m", "pip", "install", specifier]
         try:
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=120,
-            )
-            combined_output = f"{result.stdout}\n{result.stderr}"
-            return result.returncode == 0, combined_output
-        except subprocess.TimeoutExpired:
-            return False, "pip install timed out after 120 seconds."
-        except Exception as e:
-            return False, f"Failed to execute pip install: {e}"
+            res = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            return True, res.stdout
+        except subprocess.CalledProcessError as e:
+            return False, e.stderr or e.stdout
 
-    def run_tests(self, repo_dir: Path) -> tuple[int, str]:
-        """Runs pytest with deprecation warnings elevated to errors."""
-        env = os.environ.copy()
+    def run_tests(self, repo_path: Path) -> Tuple[int, str]:
+        """Executes pytest against the repo with deprecation warnings promoted to errors."""
+        resolved_repo = repo_path.resolve()
         cmd = [
             sys.executable,
             "-m",
             "pytest",
+            str(resolved_repo),
             "-v",
-            "-W", "error::DeprecationWarning",
-            "-W", "error::FutureWarning",
+            "-W",
+            "error::DeprecationWarning",
+            "-W",
+            "error::FutureWarning",
         ]
-        try:
-            result = subprocess.run(
-                cmd,
-                cwd=repo_dir,
-                capture_output=True,
-                text=True,
-                env=env,
-                timeout=60,
-            )
-            combined_output = f"{result.stdout}\n{result.stderr}"
-            return result.returncode, combined_output
-        except subprocess.TimeoutExpired:
-            return 1, "Pytest test execution timed out after 60 seconds."
-        except FileNotFoundError:
-            return 1, "pytest executable not found in current environment."
+        res = subprocess.run(cmd, cwd=str(resolved_repo), capture_output=True, text=True)
+        combined_output = f"{res.stdout}\n{res.stderr}".strip()
+        return res.returncode, combined_output
 
-    def parse_traceback(self, test_output: str, repo_dir: Path) -> list[FailureContext]:
-        """Locates project files referenced in test output and sorts by implementation priority."""
-        failures: list[FailureContext] = []
+    def parse_traceback(self, output: str, repo_path: Path) -> List[FailurePoint]:
+        """Isolates the failing repository file, line number, and error type from pytest output."""
+        failures: List[FailurePoint] = []
+        repo_path_resolved = repo_path.resolve()
 
-        # Find all Python files in the target project, ignoring venvs and caches
-        project_files = [
-            f
-            for f in repo_dir.rglob("*.py")
-            if not any(part in f.parts for part in [".venv", "venv", ".git", "__pycache__", "build", "dist"])
+        patterns = [
+            re.compile(r"([a-zA-Z0-9_\-\.\\\/:]+\.py):(\d+):\s+in\s+([^\n\r]+)"),
+            re.compile(r"([a-zA-Z0-9_\-\.\\\/:]+\.py):(\d+):"),
         ]
 
-        matched_files: list[Path] = []
-        for file_path in project_files:
-            rel_path = file_path.relative_to(repo_dir)
-            if (
-                rel_path.as_posix() in test_output
-                or str(rel_path) in test_output
-                or file_path.name in test_output
-            ):
-                matched_files.append(file_path)
+        found_candidates: List[Tuple[Path, int]] = []
+        for line in output.splitlines():
+            for pat in patterns:
+                m = pat.search(line)
+                if m:
+                    file_str = m.group(1).strip()
+                    line_no = int(m.group(2))
+                    candidate_path = Path(file_str)
+                    if not candidate_path.is_absolute():
+                        candidate_path = (repo_path_resolved / candidate_path).resolve()
+                    else:
+                        candidate_path = candidate_path.resolve()
 
-        if not matched_files:
-            return []
+                    if repo_path_resolved in candidate_path.parents and ".venv" not in candidate_path.parts:
+                        found_candidates.append((candidate_path, line_no))
 
-        # Prioritize implementation files over test files
-        matched_files.sort(
-            key=lambda p: 1 if p.name.startswith("test_") or p.name.endswith("_test.py") else 0
-        )
+        error_lines = [
+            line.strip()
+            for line in output.splitlines()
+            if line.strip().startswith(("E ", "ERROR", "pydantic.errors."))
+        ]
+        error_summary = error_lines[-1] if error_lines else "Breaking Change / Deprecation"
 
-        for target_file in matched_files:
+        if found_candidates:
+            target_file, target_line = found_candidates[-1]
             failures.append(
-                FailureContext(
+                FailurePoint(
                     file_path=target_file,
-                    line_number=None,
-                    error_type="Test Failure / Deprecation",
-                    failure_message="See traceback context",
-                    raw_traceback=test_output[-2500:],
+                    line_number=target_line,
+                    error_type=error_summary,
+                    raw_traceback=output[-3000:],
                 )
             )
 
         return failures
+
+    async def get_latest_pypi_version(self, package_name: str) -> Optional[str]:
+        """Queries PyPI JSON API for the latest release."""
+        url = f"https://pypi.org/pypi/{package_name}/json"
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(url)
+            if resp.status_code == 200:
+                data = resp.json()
+                return data.get("info", {}).get("version")
+        return None
+
+    def _parse_requirement_str(self, req: str) -> Tuple[Optional[str], str]:
+        """Helper to extract package name and constraint from string."""
+        m = re.match(r"^([a-zA-Z0-9_\-\.]+)(.*)$", req.strip())
+        if m:
+            pkg = m.group(1)
+            constraint = m.group(2).strip() or "latest"
+            return pkg, constraint
+        return None, ""

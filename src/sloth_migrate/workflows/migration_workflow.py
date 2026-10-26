@@ -1,7 +1,7 @@
 """Temporal Durable Workflow orchestrating SlothMigrate's self-healing loop."""
 
 from datetime import timedelta
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from temporalio import workflow
 from temporalio.common import RetryPolicy
 
@@ -26,24 +26,23 @@ class MigrationWorkflowInput(BaseModel):
 class MigrationWorkflowOutput(BaseModel):
     success: bool
     iterations: int
-    modified_files: list[str]
+    modified_files: list[str] = Field(default_factory=list)
+    diffs: list[str] = Field(default_factory=list)
     error_summary: str | None = None
 
 
 @workflow.defn
 class DependencyMigrationWorkflow:
-    """Durable state machine executing the sequential migration and repair cycle."""
-
     @workflow.run
     async def run(self, input_data: MigrationWorkflowInput) -> MigrationWorkflowOutput:
-        standard_retry = RetryPolicy(
+        retry_policy = RetryPolicy(
             initial_interval=timedelta(seconds=2),
             backoff_coefficient=2.0,
-            maximum_interval=timedelta(seconds=30),
+            maximum_interval=timedelta(seconds=20),
             maximum_attempts=3,
         )
 
-        # 1. Bump manifest & sandbox install
+        # 1. Bump & Install
         await workflow.execute_activity(
             bump_and_install_activity,
             BumpParams(
@@ -52,53 +51,64 @@ class DependencyMigrationWorkflow:
                 target_version=input_data.target_version,
             ),
             start_to_close_timeout=timedelta(minutes=3),
-            retry_policy=standard_retry,
+            retry_policy=retry_policy,
         )
 
         modified_files: set[str] = set()
+        diffs: list[str] = []
 
-        # 2. Sequential Durable Self-Healing Loop
+        # 2. Iterative Healing Loop
         for iteration in range(1, input_data.max_attempts + 1):
-            test_result = await workflow.execute_activity(
+            test_res = await workflow.execute_activity(
                 run_tests_activity,
                 TestRunParams(repo_path=input_data.repo_path),
                 start_to_close_timeout=timedelta(minutes=2),
             )
 
-            if test_result.exit_code == 0:
+            if test_res.exit_code == 0:
                 return MigrationWorkflowOutput(
                     success=True,
                     iterations=iteration,
                     modified_files=list(modified_files),
+                    diffs=diffs,
                 )
 
-            if not test_result.failing_files:
+            # Check for parsed actionable failure points
+            if not test_res.failures:
                 return MigrationWorkflowOutput(
                     success=False,
                     iterations=iteration,
                     modified_files=list(modified_files),
-                    error_summary="Could not isolate failing files from test output.",
+                    diffs=diffs,
+                    error_summary="Could not detect actionable files in test failure.",
                 )
 
-            # Patch primary culprit
-            primary_file = test_result.failing_files[0]
-            patch_result = await workflow.execute_activity(
+            # Pick the primary failure point with full context
+            primary_failure = test_res.failures[0]
+
+            patch_res = await workflow.execute_activity(
                 generate_and_apply_patch_activity,
                 PatchParams(
                     repo_path=input_data.repo_path,
-                    target_file=primary_file,
-                    raw_traceback=test_result.output[-2500:],
+                    target_file=primary_failure.file_path,
+                    line_number=primary_failure.line_number,
+                    error_type=primary_failure.error_type,
+                    raw_traceback=primary_failure.raw_traceback,
                 ),
                 start_to_close_timeout=timedelta(minutes=3),
-                retry_policy=standard_retry,
+                retry_policy=retry_policy,
             )
 
-            if patch_result.success:
-                modified_files.add(patch_result.modified_file)
+            if patch_res.success:
+                modified_files.add(patch_res.modified_file)
+                patch_diff = getattr(patch_res, "diff", "")
+                if patch_diff:
+                    diffs.append(patch_diff)
 
         return MigrationWorkflowOutput(
             success=False,
             iterations=input_data.max_attempts,
             modified_files=list(modified_files),
-            error_summary="Exceeded maximum repair attempts without green tests.",
+            diffs=diffs,
+            error_summary="Max attempts reached without green tests.",
         )

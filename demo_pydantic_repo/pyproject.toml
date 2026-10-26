@@ -1,0 +1,8 @@
+[project]
+name = "demo-pydantic-app"
+version = "0.1.0"
+description = "Demo project with Pydantic v1 for testing SlothMigrate migrations"
+dependencies = [
+    "pydantic==1.10.14",
+    "pytest>=7.4.0",
+]

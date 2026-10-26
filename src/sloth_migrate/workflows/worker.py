@@ -1,7 +1,7 @@
-"""Temporal worker entry point for distributed SlothMigrate runs."""
-
 import asyncio
+from rich.console import Console
 from temporalio.client import Client
+from temporalio.contrib.pydantic import pydantic_data_converter
 from temporalio.worker import Worker
 
 from sloth_migrate.config import settings
@@ -12,9 +12,17 @@ from sloth_migrate.workflows.activities import (
 )
 from sloth_migrate.workflows.migration_workflow import DependencyMigrationWorkflow
 
+console = Console()
 
-async def start_worker():
-    client = await Client.connect(settings.temporal_host, namespace=settings.temporal_namespace)
+
+async def run_worker():
+    console.print(f"[cyan]Connecting to Temporal host at [bold]{settings.temporal_host}[/bold]...[/cyan]")
+    client = await Client.connect(
+        settings.temporal_host,
+        namespace=settings.temporal_namespace,
+        data_converter=pydantic_data_converter,
+    )
+
     worker = Worker(
         client,
         task_queue=settings.temporal_task_queue,
@@ -25,9 +33,13 @@ async def start_worker():
             generate_and_apply_patch_activity,
         ],
     )
-    print(f"🦥 SlothMigrate Temporal Worker active on queue: '{settings.temporal_task_queue}'")
+
+    console.print(
+        f"[bold green]✔ SlothMigrate Temporal Worker listening on queue: [cyan]'{settings.temporal_task_queue}'[/cyan][/bold green]"
+    )
+    console.print("[dim]Press Ctrl+C to stop worker.[/dim]")
     await worker.run()
 
 
 if __name__ == "__main__":
-    asyncio.run(start_worker())
+    asyncio.run(run_worker())

@@ -64,6 +64,7 @@ async def run_generic_migration(
     target_ver: str,
 ) -> bool:
     """Executes the closed-loop dependency migration, AST repair, and test verification process."""
+    target_dir = target_dir.resolve()
     init_telemetry()
     ecosystem = PythonEcosystem()
 
@@ -176,7 +177,11 @@ async def run_generic_migration(
 
             # Step 6: AST Validation Gate
             with trace_span("ast.validate", op="ai.tool.ast_guard", data={"file": target_file.name}):
-                validation = validate_python_code(repaired_code, filename=target_file.name)
+                validation = validate_python_code(
+                    repaired_code,
+                    filename=target_file.name,
+                    original_code=original_code,
+                )
 
             if not validation.is_valid:
                 console.print(

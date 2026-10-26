@@ -45,7 +45,7 @@ class GemmaClient:
                 "ai.max_tokens": settings.llm_max_tokens,
             },
         ) as span:
-            async with httpx.AsyncClient(timeout=90.0) as client:
+            async with httpx.AsyncClient(timeout=120.0) as client:
                 response = await client.post(endpoint, headers=self.headers, json=payload)
                 response.raise_for_status()
                 data = response.json()
@@ -59,8 +59,23 @@ class GemmaClient:
         return self._extract_code_block(raw_text)
 
     def _extract_code_block(self, raw_response: str) -> str:
-        code_match = re.search(r"```(?:python)?\s*\n(.*?)```", raw_response, re.DOTALL)
-        extracted = code_match.group(1) if code_match else raw_response
+        """Strips thinking tags from reasoning models and extracts the complete Python code block."""
+        # 1. Strip thought blocks (e.g., from Gemma 4 reasoning output)
+        cleaned = re.sub(r"<thought>.*?</thought>", "", raw_response, flags=re.DOTALL).strip()
+
+        # 2. Extract code blocks from cleaned response
+        code_blocks = re.findall(r"```(?:python)?\s*\n(.*?)```", cleaned, re.DOTALL)
+        if code_blocks:
+            # Select the most comprehensive code block (the full file)
+            extracted = max(code_blocks, key=len)
+        else:
+            # Fallback if thought tags were unclosed or not present
+            all_blocks = re.findall(r"```(?:python)?\s*\n(.*?)```", raw_response, re.DOTALL)
+            if all_blocks:
+                extracted = max(all_blocks, key=len)
+            else:
+                extracted = cleaned if cleaned else raw_response
+
         return textwrap.dedent(extracted).strip() + "\n"
 
 
